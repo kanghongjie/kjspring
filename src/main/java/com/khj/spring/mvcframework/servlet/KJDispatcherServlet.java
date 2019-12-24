@@ -1,9 +1,6 @@
 package com.khj.spring.mvcframework.servlet;
 
-import com.khj.spring.mvcframework.servlet.annotation.GPAutowired;
-import com.khj.spring.mvcframework.servlet.annotation.GPController;
-import com.khj.spring.mvcframework.servlet.annotation.GPRequestMapping;
-import com.khj.spring.mvcframework.servlet.annotation.GPService;
+import com.khj.spring.mvcframework.servlet.annotation.*;
 
 import javax.servlet.ServletConfig;
 import javax.servlet.ServletException;
@@ -13,10 +10,13 @@ import javax.servlet.http.HttpServletResponse;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.URL;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public class KJDispatcherServlet extends HttpServlet {
 
@@ -29,8 +29,11 @@ public class KJDispatcherServlet extends HttpServlet {
     // ioc容器, ioc是实际用的
     private Map<String, Object> ioc = new HashMap<String, Object>();
 
-    // 保存URL（接口访问路径：/user/login）
-    private Map<String, Method> handlerMapping = new HashMap<String, Method>();
+//    // 保存URL（接口访问路径：/user/login）
+//    private Map<String, Method> handlerMapping = new HashMap<String, Method>();
+
+    // 映射URL和method
+    private List<Handler> handlerMapping = new ArrayList<Handler>();
 
 
     @Override
@@ -52,24 +55,44 @@ public class KJDispatcherServlet extends HttpServlet {
     }
 
     private void doDispatch(HttpServletRequest req, HttpServletResponse resp) throws Exception{
-        // 绝对路径
-        StringBuffer bUrl = req.getRequestURL();
-        String url = bUrl.toString();
-        // 处理成相对路径
-        String contextPath = req.getContextPath();
-        url = url.replaceAll(contextPath, "").replaceAll("/+", "/");
 
-        if (!this.handlerMapping.containsKey(url)) {
-            resp.getWriter().write("404 Not Round! + " + url);
-            return;
+        try {
+            Handler handler = getHandler(req);
+
+            if (handler == null) {
+                resp.getWriter().write("404 Not found!");
+            }
+
+            //获取方法参数列表
+            Class<?>[] paramTypes = handler.method.getParameterTypes();
+
+            //保存所有需要自动赋值的参数值
+            Object [] paramValues = new Object[paramTypes.length];
+
+            Map<String,String[]> params = req.getParameterMap();
+            for (Map.Entry<String, String[]> param : params.entrySet()) {
+                String value = Arrays.toString(param.getValue()).replaceAll("\\[|\\]", "").replaceAll(",\\s", ",");
+                System.out.println(value);
+
+                //如果找到匹配的对象，则开始填充参数值
+                if(!handler.paramIndexMapping.containsKey(param.getKey())){continue;}
+                int index = handler.paramIndexMapping.get(param.getKey());
+                paramValues[index] = convert(paramTypes[index],value);
+            }
+
+
+            //设置方法中的request和response对象
+            int reqIndex = handler.paramIndexMapping.get(HttpServletRequest.class.getName());
+            paramValues[reqIndex] = req;
+            int respIndex = handler.paramIndexMapping.get(HttpServletResponse.class.getName());
+            paramValues[respIndex] = resp;
+
+            handler.method.invoke(handler.controller, paramValues);
+
+
+        }catch(Exception e){
+            throw e;
         }
-
-        Method method = handlerMapping.get(url);
-        // 获取给方法所在类名称
-        String beanName = toLowerFirstCase(method.getDeclaringClass().getSimpleName());
-        // 获取方法参数，这里写死
-        Map<String, String[]> params = req.getParameterMap();
-        method.invoke(ioc.get(beanName), new Object[]{req, resp, params.get("name")[0]});
     }
 
     /**
@@ -99,6 +122,7 @@ public class KJDispatcherServlet extends HttpServlet {
 
     /**
      * 5、初始化HandlerMapping
+     *      映射url与method的关系
      */
     private void initHandlerMapping() {
         if (ioc.isEmpty()) {return;}
@@ -107,22 +131,110 @@ public class KJDispatcherServlet extends HttpServlet {
             Class<?> clazz = entry.getValue().getClass();
             if (!clazz.isAnnotationPresent(GPController.class)) {return;}
 
-            // 获取@RequestMapping("/hello")
+            // 获取@RequestMapping("/user")
             String beanUrl = "";
             if (clazz.isAnnotationPresent(GPRequestMapping.class)) {
                 GPRequestMapping requestMapping = clazz.getAnnotation(GPRequestMapping.class);
-                beanUrl = requestMapping.value();   // "/hello"
+                beanUrl = requestMapping.value();   // "/user"
             }
 
             // 默认获取该类所有的public方法
             for (Method method : clazz.getMethods()) {
+                // 没有@*Mapping注解的直接过滤
+                if (method.isAnnotationPresent(GPRequestMapping.class)) {continue;}
+
+                // 映射url和method
                 GPRequestMapping methodRequestMapping = method.getAnnotation(GPRequestMapping.class);
                 String url = ("/" + beanUrl + "/" + methodRequestMapping.value()).replaceAll("/+", "/");
-                handlerMapping.put(url, method);
-                System.out.println("Method:" + url + method);
+                Pattern pattern = Pattern.compile(url);
+                handlerMapping.add(new Handler(clazz.getName(), method, pattern));
+
+                System.out.println("mapping:" + url + method);
             }
         }
     }
+
+    //url传过来的参数都是String类型的，HTTP是基于字符串协议
+    //只需要把String转换为任意类型就好
+    private Object convert(Class<?> type,String value){
+        if(Integer.class == type){
+            return Integer.valueOf(value);
+        }
+        //如果还有double或者其他类型，继续加if
+        //这时候，我们应该想到策略模式了
+        //在这里暂时不实现，希望小伙伴自己来实现
+        return value;
+    }
+
+    private Handler getHandler(HttpServletRequest req) throws Exception {
+        // 绝对路径
+        StringBuffer bUrl = req.getRequestURL();
+        String url = bUrl.toString();
+        // 处理成相对路径
+        String contextPath = req.getContextPath();
+        url = url.replaceAll(contextPath, "").replaceAll("/+", "/");
+
+        for (Handler handler : handlerMapping) {
+            try {
+                Matcher matcher = handler.pattern.matcher(url);
+                if (!matcher.matches()) {
+                    continue;
+                }
+                return handler;
+            } catch (Exception e) {
+                throw e;
+            }
+        }
+        return null;
+    }
+
+    private class Handler {
+
+        private String controller;  // method对应的实例
+        private Method method;      // 映射的方法
+        private Pattern pattern;
+        private Map<String, Integer> paramIndexMapping; //method的参数顺序
+
+        public Handler(String controller, Method method, Pattern pattern) {
+            this.controller = controller;
+            this.method = method;
+            this.pattern = pattern;
+
+            paramIndexMapping = new HashMap<String, Integer>();
+            putParamIndexMapping(method);
+        }
+
+        /**
+         * 将method 中的参数+有序放入map
+         * @param method
+         */
+        private void putParamIndexMapping(Method method) {
+            // 提取参数
+            Annotation[][] annotations = method.getParameterAnnotations();
+            for (int i = 0; i < annotations.length; i++) {
+                for (Annotation a : annotations[i]) {
+                    if (a instanceof GPRequestMapping) {
+                        String paramName = ((GPRequestMapping) a).value();
+                        if (!"".equals(paramName)) {
+                            paramIndexMapping.put(paramName, i);
+                        }
+                    }
+                }
+            }
+
+            // 提取request和response
+            Class<?>[] paramTypes = method.getParameterTypes();
+            for (int i = 0; i < paramTypes.length; i++) {
+                Class<?> paramType = paramTypes[i];
+                if (paramType == HttpServletResponse.class || paramType == HttpServletRequest.class) {
+                    paramIndexMapping.put(paramType.getName(), i);
+                }
+            }
+        }
+    }
+
+
+
 
     /**
      * 4、完成依赖注入
